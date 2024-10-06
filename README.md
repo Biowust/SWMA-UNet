@@ -22,11 +22,11 @@ python train.py --dataset <dataset name> --cfg /configs/swin_tiny_patch4_window7
 ```
 
 
-## Evaluation
+## Test
 
-To evaluate my model on ImageNet, run:
+To test model , run:
 
-```eval
+```test
 python test.py --cfg /configs/swin_tiny_patch4_window7_224_lite.yaml --volume_path data/Synapse  --num_classes 9 --list_dir lists/lists_Synapse --output_dir <output dir> --model_weight <weigth path> --max_epochs 500 --img_size 224 --is_savenii --test_save_dir <save dir> --model_name XXX
 ```
 
