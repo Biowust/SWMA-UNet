@@ -596,7 +596,7 @@ class SwinTransformerSys(nn.Module):
 
         print("SwinTransformerSys expand initial----depths:{};depths_decoder:{};drop_path_rate:{};num_classes:{}".format(depths,
         depths_decoder,drop_path_rate,num_classes))
-
+        
         self.num_classes = num_classes
         self.num_layers = len(depths)
         self.embed_dim = embed_dim

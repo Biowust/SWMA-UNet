@@ -27,7 +27,11 @@ from datasets.dataset_ISIC import isic_loader
 import logging
 from utils import get_logger,save_imgs,BceDiceLoss
 from sklearn.metrics import confusion_matrix
-
+from GradCAM import show_cam_on_image
+from PIL import Image
+from skimage import morphology
+from GradCAM import GradCAM
+from utils import save_cam_heatmap
 
 def plot_result(dice, h, snapshot_path,args):
     dict = {'mean_dice': dice, 'mean_hd95': h} 
@@ -57,8 +61,7 @@ def inference(model, testloader, args, test_save_path=None):
     for i_batch, sampled_batch in tqdm(enumerate(testloader)):
         h, w = sampled_batch["image"].size()[2:]
         image, label, case_name = sampled_batch["image"], sampled_batch["label"], sampled_batch['case_name'][0]
-        metric_i = test_single_volume(image, label, model, classes=args.num_classes, patch_size=[args.img_size, args.img_size],
-                                      test_save_path=test_save_path, case=case_name, z_spacing=args.z_spacing)
+        metric_i = test_single_volume(image, label, model, classes=args.num_classes, patch_size=[args.img_size, args.img_size],test_save_path=test_save_path, case=case_name, z_spacing=args.z_spacing,args=args)
         metric_list += np.array(metric_i)
         logging.info(' idx %d case %s mean_dice %f mean_hd95 %f' % (i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
     
@@ -73,45 +76,6 @@ def inference(model, testloader, args, test_save_path=None):
     logging.info('Testing performance in best val model: mean_dice : %f mean_hd95 : %f' % (performance, mean_hd95))
     
     return performance, mean_hd95
-
-# def inference(model, testloader, args, test_save_path=None):
-#     model.eval()
-#     metric_list = 0.0
-
-#     # Grad-CAM实例，指定最后的卷积层
-#     grad_cam = GradCAM(model, target_layer="swin_unet.output")  # 替换成你的模型的最后一个卷积层名称
-
-#     for i_batch, sampled_batch in tqdm(enumerate(testloader)):
-#         h, w = sampled_batch["image"].size()[2:]
-#         image, label, case_name = sampled_batch["image"], sampled_batch["label"], sampled_batch['case_name'][0]
-#         image = image.cuda()
-
-#         # 正常推理过程
-#         metric_i = test_single_volume(image, label, model, classes=args.num_classes, patch_size=[args.img_size, args.img_size],
-#                                       test_save_path=test_save_path, case=case_name, z_spacing=args.z_spacing)
-#         metric_list += np.array(metric_i)
-
-#         # 生成并保存Grad-CAM热图
-#         class_idx = label.argmax().item()  # 获取目标类别的索引
-#         cam = grad_cam.generate_cam(image, class_idx)
-        
-#         cam_save_path = os.path.join(test_save_path, f"{case_name}_grad_cam.jpg")
-#         save_cam_image(cam, sampled_batch['image_path'][0], cam_save_path)
-#         logging.info(f'Saved Grad-CAM for {case_name} at {cam_save_path}')
-        
-#         logging.info(' idx %d case %s mean_dice %f mean_hd95 %f' % (i_batch, case_name, np.mean(metric_i, axis=0)[0], np.mean(metric_i, axis=0)[1]))
-
-#     metric_list = metric_list / len(testloader.dataset)
-
-#     for i in range(1, args.num_classes):
-#         logging.info('Mean class %d mean_dice %f mean_hd95 %f' % (i, metric_list[i-1][0], metric_list[i-1][1]))
-
-#     performance = np.mean(metric_list, axis=0)[0]
-#     mean_hd95 = np.mean(metric_list, axis=0)[1]
-
-#     logging.info('Testing performance in best val model: mean_dice : %f mean_hd95 : %f' % (performance, mean_hd95))
-
-#     return performance, mean_hd95
 
 def trainer_synapse(args, model, snapshot_path):
     from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
@@ -532,7 +496,7 @@ def trainer_ISIC(args, model, snapshot_path):
         }, checkpoint_path)
 
         # Periodic Evaluation and Model Saving
-        if (epoch_num + 1) % args.eval_interval == 0 and (epoch_num + 1) > 99:
+        if (epoch_num + 1) % args.eval_interval == 0 and (epoch_num + 1) > 199:
             loss, miou, f1_or_dsc = test_isic(testloader, model, logger,args)
             if f1_or_dsc > best_f1_or_dsc:
                 filename = f'epoch_{epoch_num}_{f1_or_dsc:.4f}.pth'
@@ -549,8 +513,6 @@ def trainer_ISIC(args, model, snapshot_path):
 
     return "Training Finished!"
 
-    
-
 def test_isic(test_loader,
                     model,
                     logger,
@@ -561,54 +523,70 @@ def test_isic(test_loader,
     preds = []
     gts = []
     loss_list = []
-    with torch.no_grad():
-        for i, data in enumerate(tqdm(test_loader)):
-            if type(data) is list:
-                img, msk = data
-            elif type(data) is dict:
-                img, msk = data['image'], data['label']
-            else:
-                raise ValueError('data type is not list or dict')
-            bce_dice_loss = BceDiceLoss()
-            img, msk = img.cuda(non_blocking=True).float(), msk.cuda(non_blocking=True).float()
+
+    target_layer = model.swma_unet.output  # 根据实际模型的目标层修改
+    grad_cam = GradCAM(model=model, target_layers=[target_layer])
+
+    for i, data in enumerate(tqdm(test_loader)):
+        if type(data) is list:
+            img, msk = data
+        elif type(data) is dict:
+            img, msk = data['image'], data['label']
+        else:
+            raise ValueError('data type is not list or dict')
+        bce_dice_loss = BceDiceLoss()
+        img, msk = img.cuda(non_blocking=True).float(), msk.cuda(non_blocking=True).float()
+        with torch.no_grad():
             out = torch.sigmoid(model(img))
-            loss = bce_dice_loss(out, msk)
-            loss_list.append(loss.item())
-            msk = msk.squeeze(1).cpu().detach().numpy()
-            gts.append(msk)
-            if type(out) is tuple:
-                out = out[0]
-            out = out.squeeze(1).cpu().detach().numpy()
-            preds.append(out) 
-            save_imgs(img, msk, out, i, args.output_dir + 'outputs/', args.dataset, 0.5, test_data_name=test_data_name)
+        loss = bce_dice_loss(out, msk)
+        loss_list.append(loss.item())
+        msk = msk.squeeze(1).cpu().detach().numpy()
+        gts.append(msk)
+        if type(out) is tuple:
+            out = out[0]
+        out = out.squeeze(1).cpu().detach().numpy()
+        preds.append(out) 
+        save_imgs(img, msk, out, i, args.output_dir + '/outputs/', args.dataset, 0.5, test_data_name=test_data_name)
 
-        preds = np.array(preds).reshape(-1)
-        gts = np.array(gts).reshape(-1)
+        # Grad-CAM 热图生成
+        grayscale_cam = grad_cam(input_tensor=img, target_category=0)
+        grayscale_cam = grayscale_cam[0, :]
+        img_RGB = img[0].permute(1, 2, 0).detach().cpu().numpy()
+        img_RGB = (img_RGB - np.min(img_RGB)) / (np.max(img_RGB) - np.min(img_RGB)) 
 
-        y_pre = np.where(preds>=0.5, 1, 0)
-        y_true = np.where(gts>=0.5, 1, 0)
+        if np.max(img_RGB) > 1.0:  
+            img_RGB = img_RGB / 255.0
+        cam_image = show_cam_on_image(img_RGB, grayscale_cam, use_rgb=True)
 
-        confusion = confusion_matrix(y_true, y_pre)
-        TN, FP, FN, TP = confusion[0,0], confusion[0,1], confusion[1,0], confusion[1,1] 
+        cam_save_path = os.path.join(args.output_dir, f'cam_{i}.jpg')
+        os.makedirs(os.path.dirname(cam_save_path), exist_ok=True)
+        save_cam_heatmap(cam_image, grayscale_cam, cam_save_path)
 
-        accuracy = float(TN + TP) / float(np.sum(confusion)) if float(np.sum(confusion)) != 0 else 0
-        sensitivity = float(TP) / float(TP + FN) if float(TP + FN) != 0 else 0
-        specificity = float(TN) / float(TN + FP) if float(TN + FP) != 0 else 0
-        f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
-        miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
+    preds = np.array(preds).reshape(-1)
+    gts = np.array(gts).reshape(-1)
 
-        if test_data_name is not None:
-            log_info = f'test_datasets_name: {test_data_name}'
-            print(log_info)
-            logger.info(log_info)
-        log_info = f'test of best model, loss: {np.mean(loss_list):.4f},miou: {miou}, f1_or_dsc: {f1_or_dsc}, accuracy: {accuracy}, \
-                specificity: {specificity}, sensitivity: {sensitivity}, confusion_matrix: {confusion}'
+    y_pre = np.where(preds>=0.5, 1, 0)
+    y_true = np.where(gts>=0.5, 1, 0)
+
+    confusion = confusion_matrix(y_true, y_pre)
+    TN, FP, FN, TP = confusion[0,0], confusion[0,1], confusion[1,0], confusion[1,1] 
+
+    accuracy = float(TN + TP) / float(np.sum(confusion)) if float(np.sum(confusion)) != 0 else 0
+    sensitivity = float(TP) / float(TP + FN) if float(TP + FN) != 0 else 0
+    specificity = float(TN) / float(TN + FP) if float(TN + FP) != 0 else 0
+    f1_or_dsc = float(2 * TP) / float(2 * TP + FP + FN) if float(2 * TP + FP + FN) != 0 else 0
+    miou = float(TP) / float(TP + FP + FN) if float(TP + FP + FN) != 0 else 0
+
+    if test_data_name is not None:
+        log_info = f'test_datasets_name: {test_data_name}'
         print(log_info)
         logger.info(log_info)
+    log_info = f'test of best model, loss: {np.mean(loss_list):.4f},miou: {miou}, f1_or_dsc: {f1_or_dsc}, accuracy: {accuracy}, \
+            specificity: {specificity}, sensitivity: {sensitivity}, confusion_matrix: {confusion}'
+    print(log_info)
+    logger.info(log_info)
 
     return np.mean(loss_list),miou,f1_or_dsc
-
-
 
 def get_last_conv_layer(model):
     last_conv = None

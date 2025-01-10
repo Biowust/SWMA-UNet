@@ -8,10 +8,20 @@ import os
 import logging
 from matplotlib import pyplot as plt
 from torch.nn.modules.loss import CrossEntropyLoss
-import torch.nn.functional as F
+import torch.nn.functional as nF
 import cv2
 from torchvision import models, transforms
+from torch.optim.optimizer import Optimizer
+import weakref
+from functools import wraps
+import math
+from sklearn.metrics import roc_auc_score,jaccard_score
+from GradCAM import GradCAM
 
+import copy
+from PIL import Image
+from GradCAM import show_cam_on_image
+from skimage import morphology
 
 class DiceLoss(nn.Module):
     def __init__(self, n_classes=1):
@@ -50,8 +60,6 @@ class DiceLoss(nn.Module):
             loss += dice * weight[i]
         return loss / self.n_classes  # 对类的总权重进行归一化处理可能会更稳健
 
-
-
 def calculate_metric_percase(pred, gt):
     pred[pred > 0] = 1
     gt[gt > 0] = 1
@@ -64,58 +72,107 @@ def calculate_metric_percase(pred, gt):
     else:
         return 0, 0
 
-
 def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_save_path=None, case=None, z_spacing=1):
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
-    grad_cam = GradCAM(net, target_layer="swma_unet.output")  # 根据模型调整最后一层的名字
-
+    grad_cam = GradCAM(net, target_layers=[net.swma_unet.output])  # Adjust target layer for the model
     prediction = np.zeros_like(label)
+
     for ind in range(image.shape[0]):
-        slice = image[ind, :, :]
-        x, y = slice.shape[0], slice.shape[1]
+        slice_img = image[ind, :, :]
+        x, y = slice_img.shape[0], slice_img.shape[1]
         if x != patch_size[0] or y != patch_size[1]:
-            slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)  # previous using 0
-        input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
+            slice_img = zoom(slice_img, (patch_size[0] / x, patch_size[1] / y), order=3)  # Resize for patch compatibility
+        input_tensor = torch.from_numpy(slice_img).unsqueeze(0).unsqueeze(0).float().cuda()
 
         net.eval()
         with torch.no_grad():
-            outputs = net(input)
-        out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
-        out = out.cpu().detach().numpy()
+            outputs = net(input_tensor)
+        out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0).cpu().detach().numpy()
+
         if x != patch_size[0] or y != patch_size[1]:
             pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
         else:
             pred = out
         prediction[ind] = pred
+        mode_class = torch.mode(torch.flatten(torch.tensor(out))).values.item()
+        # Generate CAM for each slice
+        grayscale_cam = grad_cam(input_tensor=input_tensor, target_category=mode_class)
+        grayscale_cam = grayscale_cam[0, :]
+        slice_save_path = os.path.join(test_save_path, f"{case}_slice_{ind}_grad_cam_overlay.jpg")
+        save_cam_heatmap(slice_img, grayscale_cam, slice_save_path)
 
-        # 生成热图
-        # mode_class = torch.mode(torch.flatten(out)).values.item()  # 使用 mode 计算主要类别
-        mode_class = torch.mode(torch.flatten(torch.tensor(out))).values.item()  # 使用 mode 计算主要类别
-        cam = grad_cam.generate_cam(input, mode_class)
+    # Calculate metrics per class
+    metric_list = [calculate_metric_percase(prediction == i, label == i) for i in range(1, classes)]
 
-        # 保存叠加图像
-        cam_save_path = os.path.join(test_save_path, f"{case}_slice_{ind}_mode_class_{mode_class}_grad_cam_overlay.jpg")
-        save_cam_image(cam, slice, cam_save_path)
-
-    metric_list = []
-    for i in range(1, classes):
-        metric_list.append(calculate_metric_percase(prediction == i, label == i))
-
-    if test_save_path is not None:
+    # Save prediction and original images in ITK format
+    if test_save_path:
+        os.makedirs(test_save_path, exist_ok=True)
         img_itk = sitk.GetImageFromArray(image.astype(np.float32))
         prd_itk = sitk.GetImageFromArray(prediction.astype(np.float32))
         lab_itk = sitk.GetImageFromArray(label.astype(np.float32))
         img_itk.SetSpacing((1, 1, z_spacing))
         prd_itk.SetSpacing((1, 1, z_spacing))
         lab_itk.SetSpacing((1, 1, z_spacing))
-        if not os.path.exists(test_save_path):
-            os.makedirs(test_save_path)
         sitk.WriteImage(prd_itk, os.path.join(test_save_path, f'{case}_pred.nii.gz'))
         sitk.WriteImage(img_itk, os.path.join(test_save_path, f'{case}_img.nii.gz'))
         sitk.WriteImage(lab_itk, os.path.join(test_save_path, f'{case}_gt.nii.gz'))
 
     return metric_list
 
+import matplotlib.pyplot as plt
+from matplotlib import cm
+
+def apply_custom_colormap(grayscale_cam, img, save_path):
+    """
+    应用自定义红蓝颜色映射，叠加注意力热图。
+    """
+    # 确保 grayscale_cam 范围在 [0, 1]
+    grayscale_cam = np.clip(grayscale_cam, 0, 1)
+    
+    # 使用 'hot' 或其他自定义映射
+    colormap = cm.get_cmap('RdBu')  # 或 'seismic' 等映射
+    heatmap = colormap(grayscale_cam)[:, :, :3]  # 获取 RGB 通道
+
+    # 确保原图在 [0, 1]
+    if np.max(img) > 1.0:
+        img = img / 255.0
+    # 转换为 uint8 类型以匹配 OpenCV 需求
+    heatmap = (heatmap * 255).astype(np.uint8)
+    img = (img * 255).astype(np.uint8)
+    # 将热图与原图融合，按比例叠加
+    overlay = cv2.addWeighted(img, 0.6, heatmap, 0.4, 0)
+
+    # 保存叠加后的结果
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.imshow(overlay)
+    plt.axis('off')
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+
+def save_cam_heatmap(image, grayscale_cam, save_path, overlay=True,cmap='coolwarm'):
+    # 确保输入图像是 numpy 数组
+    if isinstance(image, Image.Image):  # 如果是 PIL 图像
+        image = np.array(image)
+
+    # 确保图像范围在 [0, 1]
+    if np.max(image) > 1.0:
+        image = image / 255.0
+
+    # 确保图像是 RGB 三通道
+    if len(image.shape) == 2:  # 如果是灰度图像
+        image = np.stack([image] * 3, axis=-1)
+
+    if overlay:
+        # 应用自定义颜色映射
+        apply_custom_colormap(grayscale_cam, image, save_path)
+    else:
+        # 如果仅保存热图
+        plt.imshow(grayscale_cam, cmap=cmap)
+        plt.axis('off')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+        plt.close()
 
 def get_logger(name, log_dir):
     '''
@@ -221,93 +278,260 @@ def save_imgs(img, msk, msk_pred, i, save_path, datasets, threshold=0.5, test_da
     plt.savefig(save_path + str(i) +'.png')
     plt.close()
 
+class WeightedDiceBCE(nn.Module):
+    def __init__(self,dice_weight=1,BCE_weight=1):
+        super(WeightedDiceBCE, self).__init__()
+        self.BCE_loss = WeightedBCE(weights=[0.5, 0.5])
+        self.dice_loss = WeightedDiceLoss(weights=[0.5, 0.5])
+        self.BCE_weight = BCE_weight
+        self.dice_weight = dice_weight
 
-class GradCAM:
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activation = None
-        self.model.eval()
-        self.register_hooks()
+    def _show_dice(self, inputs, targets):
+        inputs[inputs>=0.5] = 1
+        inputs[inputs<0.5] = 0
+        targets[targets>0] = 1
+        targets[targets<=0] = 0
+        hard_dice_coeff = 1.0 - self.dice_loss(inputs, targets)
+        return hard_dice_coeff
 
-    def register_hooks(self):
-        def forward_hook(module, input, output):
-            self.activation = output.detach()
+    def forward(self, inputs, targets):
+        dice = self.dice_loss(inputs, targets)
+        BCE = self.BCE_loss(inputs, targets)
+        dice_BCE_loss = self.dice_weight * dice + self.BCE_weight * BCE
+
+        return dice_BCE_loss
+
+class WeightedBCE(nn.Module):
+    def __init__(self, weights=[0.4, 0.6]):
+        super(WeightedBCE, self).__init__()
+        self.weights = weights
+
+    def forward(self, logit_pixel, truth_pixel):
+        logit = logit_pixel.view(-1)
+        truth = truth_pixel.view(-1)
+        assert(logit.shape == truth.shape)
         
-        def backward_hook(module, grad_input, grad_output):
-            self.gradients = grad_output[0].detach()
-
-        for name, module in self.model.named_modules():
-            if name == self.target_layer:
-                module.register_forward_hook(forward_hook)
-                module.register_backward_hook(backward_hook)
-
-    def generate_cam(self, input_tensor, class_idx):
-        # 确保 input_tensor 需要梯度
-        input_tensor.requires_grad = True
+        # 计算正负样本的权重
+        pos_weight = (truth > 0.5).float().sum() + 1e-12
+        neg_weight = (truth < 0.5).float().sum() + 1e-12
+        pos_weight_tensor = torch.tensor(self.weights[0] / pos_weight).to(logit.device)
+        neg_weight_tensor = torch.tensor(self.weights[1] / neg_weight).to(logit.device)
         
-        # 执行前向传播
-        output = self.model(input_tensor)
-        
-        # 确保 model zero_grad 是在 output 计算之前
-        self.model.zero_grad()
+        # 使用 BCEWithLogitsLoss 并通过 pos_weight 参数来实现加权
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor / neg_weight_tensor)
+        loss = criterion(logit, truth)
 
-        # 创建 one_hot_output
-        one_hot_output = torch.zeros_like(output)
-        one_hot_output[0][class_idx] = 1
-        
-        # 进行反向传播
-        output.backward(gradient=one_hot_output)
+        return loss
 
-        # 获取梯度和激活
-        gradients = self.gradients.cpu().numpy()
-        activations = self.activation.cpu().numpy()
 
-        # 计算权重
-        weights = np.mean(gradients, axis=(2, 3))
+class WeightedDiceLoss(nn.Module):
+    def __init__(self, weights=[0.5, 0.5]): # W_pos=0.8, W_neg=0.2
+        super(WeightedDiceLoss, self).__init__()
+        self.weights = weights
 
-        # 初始化 cam
-        cam = np.zeros(activations.shape[2:], dtype=np.float32)
-        for i, w in enumerate(weights[0]):
-            cam += w * activations[0, i, :, :]
+    def forward(self, logit, truth, smooth=1e-5):
+        batch_size = len(logit)
+        logit = logit.view(batch_size,-1)
+        truth = truth.view(batch_size,-1)
+        assert(logit.shape==truth.shape)
+        p = logit.view(batch_size,-1)
+        t = truth.view(batch_size,-1)
+        w = truth.detach()
+        w = w*(self.weights[1]-self.weights[0])+self.weights[0]
 
-        # 处理 cam
-        cam = np.maximum(cam, 0)
-        cam = cv2.resize(cam, (input_tensor.shape[2], input_tensor.shape[3]))
-        cam -= np.min(cam)
-        cam /= np.max(cam)
-        
-        return cam
+        p = w*(p)
+        t = w*(t)
+        intersection = (p * t).sum(-1)
+        union =  (p * p).sum(-1) + (t * t).sum(-1)
+        dice  = 1 - (2*intersection + smooth) / (union +smooth)
 
-def save_cam_image(cam, original_image, save_path):
-    # 假设 original_image 是 numpy 数组 (slice)
-    original_image = np.uint8((original_image - np.min(original_image)) / (np.max(original_image) - np.min(original_image)) * 255)
-    original_image = cv2.cvtColor(original_image, cv2.COLOR_GRAY2BGR)  # 将灰度图转为伪彩色图
+        loss = dice.mean()
+        return loss
 
-    # 调整 cam 大小与原图相匹配
-    cam = cv2.resize(cam, (original_image.shape[1], original_image.shape[0]))
+class _LRScheduler(object):
 
-    # 创建自定义颜色映射查找表 (LUT)
-    lut = np.zeros((256, 1, 3), dtype=np.uint8)
-    for i in range(256):
-        if i < 128:
-            lut[i, 0, 0] = 2 * i  # 红色通道
-            lut[i, 0, 1] = 2 * i  # 绿色通道
-            lut[i, 0, 2] = 0  # 蓝色通道
+    def __init__(self, optimizer, last_epoch=-1):
+
+        # Attach optimizer
+        if not isinstance(optimizer, Optimizer):
+            raise TypeError('{} is not an Optimizer'.format(
+                type(optimizer).__name__))
+        self.optimizer = optimizer
+
+        # Initialize epoch and base learning rates
+        if last_epoch == -1:
+            for group in optimizer.param_groups:
+                group.setdefault('initial_lr', group['lr'])
         else:
-            lut[i, 0, 0] = 0  # 红色通道
-            lut[i, 0, 1] = 0  # 绿色通道
-            lut[i, 0, 2] = 255 - i  # 蓝色通道
-
-    # 生成伪彩色热图
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam), lut)
-
-    # 将热图叠加在原始图像上
-    overlayed_image = cv2.addWeighted(heatmap, 0.4, original_image, 0.6, 0)  # 调整权重以改变效果
-
-    # 保存叠加后的图像
-    cv2.imwrite(save_path, np.uint8(overlayed_image))
+            for i, group in enumerate(optimizer.param_groups):
+                if 'initial_lr' not in group:
+                    raise KeyError("param 'initial_lr' is not specified "
+                                   "in param_groups[{}] when resuming an optimizer".format(i))
+        self.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
+        self.last_epoch = last_epoch
 
 
+        def with_counter(method):
+            if getattr(method, '_with_counter', False):
+                return method
 
+            instance_ref = weakref.ref(method.__self__)
+            func = method.__func__
+            cls = instance_ref().__class__
+            del method
+
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                instance = instance_ref()
+                instance._step_count += 1
+                wrapped = func.__get__(instance, cls)
+                return wrapped(*args, **kwargs)
+
+            wrapper._with_counter = True
+            return wrapper
+
+        self.optimizer.step = with_counter(self.optimizer.step)
+        self.optimizer._step_count = 0
+        self._step_count = 0
+
+        self.step()
+
+    def state_dict(self):
+        """Returns the state of the scheduler as a :class:`dict`.
+
+        It contains an entry for every variable in self.__dict__ which
+        is not the optimizer.
+        """
+        return {key: value for key, value in self.__dict__.items() if key != 'optimizer'}
+
+    def load_state_dict(self, state_dict):
+        """Loads the schedulers state.
+
+        Arguments:
+            state_dict (dict): scheduler state. Should be an object returned
+                from a call to :meth:`state_dict`.
+        """
+        self.__dict__.update(state_dict)
+
+    def get_last_lr(self):
+        """ Return last computed learning rate by current scheduler.
+        """
+        return self._last_lr
+
+    def get_lr(self):
+        raise NotImplementedError
+
+    def step(self, epoch=None):
+        if self._step_count == 1:
+            if not hasattr(self.optimizer.step, "_with_counter"):
+                warnings.warn("Seems like `optimizer.step()` has been overridden after learning rate scheduler "
+                              "initialization. Please, make sure to call `optimizer.step()` before "
+                              "`lr_scheduler.step()`. See more details at "
+                              "https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate", UserWarning)
+
+            elif self.optimizer._step_count < 1:
+                warnings.warn("Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
+                              "In PyTorch 1.1.0 and later, you should call them in the opposite order: "
+                              "`optimizer.step()` before `lr_scheduler.step()`.  Failure to do this "
+                              "will result in PyTorch skipping the first value of the learning rate schedule. "
+                              "See more details at "
+                              "https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate", UserWarning)
+        self._step_count += 1
+
+        class _enable_get_lr_call:
+
+            def __init__(self, o):
+                self.o = o
+
+            def __enter__(self):
+                self.o._get_lr_called_within_step = True
+                return self
+
+            def __exit__(self, type, value, traceback):
+                self.o._get_lr_called_within_step = False
+                return self
+
+        with _enable_get_lr_call(self):
+            if epoch is None:
+                self.last_epoch += 1
+                values = self.get_lr()
+            else:
+                self.last_epoch = epoch
+                if hasattr(self, "_get_closed_form_lr"):
+                    values = self._get_closed_form_lr()
+                else:
+                    values = self.get_lr()
+
+        for param_group, lr in zip(self.optimizer.param_groups, values):
+            param_group['lr'] = lr
+
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
+
+class CosineAnnealingWarmRestarts(_LRScheduler):
+
+    def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+        if T_0 <= 0 or not isinstance(T_0, int):
+            raise ValueError("Expected positive integer T_0, but got {}".format(T_0))
+        if T_mult < 1 or not isinstance(T_mult, int):
+            raise ValueError("Expected integer T_mult >= 1, but got {}".format(T_mult))
+        self.T_0 = T_0
+        self.T_i = T_0
+        self.T_mult = T_mult
+        self.eta_min = eta_min
+
+        super(CosineAnnealingWarmRestarts, self).__init__(optimizer, last_epoch)
+
+        self.T_cur = self.last_epoch
+
+    def get_lr(self):
+        if not self._get_lr_called_within_step:
+            warnings.warn("To get the last learning rate computed by the scheduler, "
+                          "please use `get_last_lr()`.", DeprecationWarning)
+
+        return [self.eta_min + (base_lr - self.eta_min) * (1 + math.cos(math.pi * self.T_cur / self.T_i)) / 2
+                for base_lr in self.base_lrs]
+
+    def step(self, epoch=None):
+
+        if epoch is None and self.last_epoch < 0:
+            epoch = 0
+
+        if epoch is None:
+            epoch = self.last_epoch + 1
+            self.T_cur = self.T_cur + 1
+            if self.T_cur >= self.T_i:
+                self.T_cur = self.T_cur - self.T_i
+                self.T_i = self.T_i * self.T_mult
+        else:
+            if epoch < 0:
+                raise ValueError("Expected non-negative epoch, but got {}".format(epoch))
+            if epoch >= self.T_0:
+                if self.T_mult == 1:
+                    self.T_cur = epoch % self.T_0
+                else:
+                    n = int(math.log((epoch / self.T_0 * (self.T_mult - 1) + 1), self.T_mult))
+                    self.T_cur = epoch - self.T_0 * (self.T_mult ** n - 1) / (self.T_mult - 1)
+                    self.T_i = self.T_0 * self.T_mult ** (n)
+            else:
+                self.T_i = self.T_0
+                self.T_cur = epoch
+        self.last_epoch = math.floor(epoch)
+
+        class _enable_get_lr_call:
+
+            def __init__(self, o):
+                self.o = o
+
+            def __enter__(self):
+                self.o._get_lr_called_within_step = True
+                return self
+
+            def __exit__(self, type, value, traceback):
+                self.o._get_lr_called_within_step = False
+                return self
+
+        with _enable_get_lr_call(self):
+            for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+                param_group['lr'] = lr
+
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
