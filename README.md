@@ -2,7 +2,10 @@
 # SWMA-UNet
 
 This repository is the official implementation of SWMA-UNet. 
+Abstract
+In recent years, deep learning achieves significant advancements in medical image segmentation. Research finds that integrating Transformers and CNNs effectively addresses the limitations of CNNs in managing long-distance dependencies and understanding global information.However, existing models typically employ a serial approach to combine Transformers and CNNs, which complicates the simultaneous processing of global and local information. To address this, our study proposes a parallel multi-path attention architecture, SWMA-UNET, that integrates Transformers and CNNs. This architecture deeply mines features through parallel strategies while capturing both local details and global context information, thereby enhancing the accuracy of medical image segmentation. Experimental results indicate that our method surpasses all previously reported methods in the literature on the Synapse, ACDC ,ISIC 2018 and MoNuSeg datasets.
 
+[JBHI 2024] The codes for the work "SWMA-UNet: Multi-Path Attention Network for Improved Medical Image Segmentation"(https://ieeexplore.ieee.org/abstract/document/10817525). Our paper has been accepted by JBHI 2024. We updated the Reproducibility. I hope this will help you to reproduce the results.
 ## Requirements
 
 To install requirements:
